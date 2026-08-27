@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+python-engine/__pycache__/
+python-engine/.venv/
+python-engine/venv/
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# Build outputs
+dist/
+build/
+out/
+target/
+src-tauri/target/
+
+# Vite / TS
+.vite/
+*.tsbuildinfo
+
+# Env & OS
+.env
+.env.local
+.env.*.local
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Rust
+**/*.rs.bk
+Cargo.lock
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Misc
+coverage/
+.nyc_output/
