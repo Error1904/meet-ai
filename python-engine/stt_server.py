@@ -58,99 +58,173 @@ def load_whisper():
                 print("[STT Server] Fallback to 'tiny.en' whisper model succeeded.")
             except Exception as e2:
                 print(f"[STT Server Fatal] {e2}")
+import pyaudiowpatch as pyaudio
+
 # Audio Loopback & Microphone Stream Ingestion
 def audio_capture_worker(loop):
-    """Captures real OS microphone and system audio streams and transcribes using Faster-Whisper."""
+    """Captures dual OS audio channels (Microphone + WASAPI System Audio Loopback) and transcribes using Faster-Whisper."""
     global is_recording, active_session_id, transcript_buffer, whisper_model
     
-    print("[Audio Capture] Starting real live microphone audio capture stream...")
-    audio_queue = queue.Queue()
+    print("[Audio Capture] Starting OS dual audio capture stream (Mic + WASAPI Loopback)...")
+    mic_queue = queue.Queue()
+    loopback_queue = queue.Queue()
 
-    def audio_callback(indata, frames, time_info, status):
-        if is_recording:
-            audio_queue.put(indata.copy().flatten())
+    p = pyaudio.PyAudio()
 
-    stream = None
+    # Discover WASAPI loopback device (for other meeting participants' voice output)
+    loopback_dev = None
     try:
-        stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype='float32',
-            callback=audio_callback,
-            blocksize=4000
-        )
-        stream.start()
-        print("[Audio Capture] Real-time sounddevice InputStream active.")
+        wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+        default_out = p.get_device_info_by_index(wasapi['defaultOutputDevice'])
+        for d in p.get_device_info_generator():
+            if d.get('isLoopbackDevice') and default_out['name'] in d['name']:
+                loopback_dev = d
+                break
+        if not loopback_dev:
+            loopback_dev = next((d for d in p.get_device_info_generator() if d.get('isLoopbackDevice')), None)
     except Exception as e:
-        print(f"[Audio Capture Error] Could not start sounddevice InputStream: {e}")
+        print(f"[Audio Capture Warning] WASAPI discovery failed: {e}")
 
-    audio_buffer = np.array([], dtype=np.float32)
+    # Discover microphone input device (for user's voice input)
+    mic_dev = None
+    try:
+        mic_dev = p.get_default_input_device_info()
+    except Exception as e:
+        print(f"[Audio Capture Warning] Default mic discovery failed: {e}")
+
+    # Callbacks
+    def mic_callback(in_data, frame_count, time_info, status):
+        if is_recording:
+            audio_data = np.frombuffer(in_data, dtype=np.float32)
+            mic_queue.put(audio_data)
+        return (None, pyaudio.paContinue)
+
+    def loopback_callback(in_data, frame_count, time_info, status):
+        if is_recording:
+            audio_data = np.frombuffer(in_data, dtype=np.float32)
+            if loopback_dev and loopback_dev['maxInputChannels'] > 1:
+                audio_data = audio_data.reshape(-1, loopback_dev['maxInputChannels']).mean(axis=1)
+            loopback_queue.put((audio_data, int(loopback_dev['defaultSampleRate']) if loopback_dev else 48000))
+        return (None, pyaudio.paContinue)
+
+    # Start audio streams
+    stream_mic = None
+    if mic_dev:
+        try:
+            stream_mic = p.open(
+                format=pyaudio.paFloat32,
+                channels=1,
+                rate=16000,
+                input=True,
+                input_device_index=mic_dev['index'],
+                stream_callback=mic_callback
+            )
+            stream_mic.start_stream()
+            print(f"[Audio Capture] Microphone stream started: {mic_dev['name']}")
+        except Exception as e:
+            print(f"[Audio Capture Error] Failed to start mic stream: {e}")
+
+    stream_loop = None
+    if loopback_dev:
+        try:
+            stream_loop = p.open(
+                format=pyaudio.paFloat32,
+                channels=loopback_dev['maxInputChannels'],
+                rate=int(loopback_dev['defaultSampleRate']),
+                input=True,
+                input_device_index=loopback_dev['index'],
+                stream_callback=loopback_callback
+            )
+            stream_loop.start_stream()
+            print(f"[Audio Capture] WASAPI System Audio Loopback stream started: {loopback_dev['name']}")
+        except Exception as e:
+            print(f"[Audio Capture Error] Failed to start loopback stream: {e}")
+
+    mic_buffer = np.array([], dtype=np.float32)
+    loopback_buffer = np.array([], dtype=np.float32)
+
+    def resample_to_16k(audio, orig_sr):
+        if orig_sr == 16000:
+            return audio
+        num_output_samples = int(len(audio) * 16000 / orig_sr)
+        if num_output_samples <= 0:
+            return np.array([], dtype=np.float32)
+        x_old = np.linspace(0, 1, len(audio))
+        x_new = np.linspace(0, 1, num_output_samples)
+        return np.interp(x_new, x_old, audio).astype(np.float32)
+
+    def process_speech_chunk(chunk, speaker_name):
+        if len(chunk) < CHUNK_SIZE or not active_session_id or whisper_model is None:
+            return
+        rms = np.sqrt(np.mean(chunk ** 2))
+        if rms > 0.005:  # Voice activity detected above background noise
+            try:
+                segments, info = whisper_model.transcribe(
+                    chunk,
+                    beam_size=1,
+                    vad_filter=True
+                )
+                text = " ".join([seg.text.strip() for seg in segments if seg.text.strip()]).strip()
+                if text and len(text) > 1:
+                    now_ms = int(time.time() * 1000)
+                    item = {
+                        "session_id": active_session_id,
+                        "speaker": speaker_name,
+                        "text": text,
+                        "timestamp_ms": now_ms,
+                        "confidence": 0.95
+                    }
+                    database.save_transcript_item(active_session_id, speaker_name, text, now_ms, 0.95)
+                    with audio_lock:
+                        transcript_buffer.append(item)
+                        if len(transcript_buffer) > 200:
+                            transcript_buffer.pop(0)
+                    print(f"[Live STT] [{speaker_name}] {text}")
+                    asyncio.run_coroutine_threadsafe(broadcast_event("transcript", item), loop)
+            except Exception as stt_err:
+                print(f"[STT Error - {speaker_name}] {stt_err}")
 
     while True:
         if not is_recording:
-            audio_buffer = np.array([], dtype=np.float32)
-            # Drain queue if paused
-            while not audio_queue.empty():
-                try:
-                    audio_queue.get_nowait()
-                except Exception:
-                    break
+            mic_buffer = np.array([], dtype=np.float32)
+            loopback_buffer = np.array([], dtype=np.float32)
+            while not mic_queue.empty():
+                try: mic_queue.get_nowait()
+                except Exception: break
+            while not loopback_queue.empty():
+                try: loopback_queue.get_nowait()
+                except Exception: break
             time.sleep(0.3)
             continue
 
-        # Collect audio chunks from queue
-        while not audio_queue.empty():
+        # Drain Mic Queue
+        while not mic_queue.empty():
             try:
-                chunk = audio_queue.get_nowait()
-                audio_buffer = np.append(audio_buffer, chunk)
+                data = mic_queue.get_nowait()
+                mic_buffer = np.append(mic_buffer, data)
             except Exception:
                 break
 
-        # Process every CHUNK_SIZE (approx 3.0s = 48000 samples)
-        if len(audio_buffer) >= CHUNK_SIZE:
-            current_chunk = audio_buffer[:CHUNK_SIZE]
-            audio_buffer = audio_buffer[CHUNK_SIZE:]
+        # Drain Loopback Queue
+        while not loopback_queue.empty():
+            try:
+                data, orig_sr = loopback_queue.get_nowait()
+                data_16k = resample_to_16k(data, orig_sr)
+                loopback_buffer = np.append(loopback_buffer, data_16k)
+            except Exception:
+                break
 
-            if not active_session_id:
-                continue
+        # Process Mic Buffer (User)
+        if len(mic_buffer) >= CHUNK_SIZE:
+            chunk = mic_buffer[:CHUNK_SIZE]
+            mic_buffer = mic_buffer[CHUNK_SIZE:]
+            process_speech_chunk(chunk, "User")
 
-            # Calculate Root Mean Square (RMS) energy to detect voice/speech
-            rms = np.sqrt(np.mean(current_chunk ** 2))
-
-            if rms > 0.005 and whisper_model is not None:
-                try:
-                    segments, info = whisper_model.transcribe(
-                        current_chunk,
-                        beam_size=1,
-                        vad_filter=True
-                    )
-                    text = " ".join([seg.text.strip() for seg in segments if seg.text.strip()]).strip()
-
-                    if text and len(text) > 1:
-                        now_ms = int(time.time() * 1000)
-                        # Alternate speaker label or tag based on session context if needed
-                        speaker = "User"
-                        item = {
-                            "session_id": active_session_id,
-                            "speaker": speaker,
-                            "text": text,
-                            "timestamp_ms": now_ms,
-                            "confidence": 0.95
-                        }
-
-                        # Store in SQLite and Memory Buffer
-                        database.save_transcript_item(active_session_id, speaker, text, now_ms, 0.95)
-
-                        with audio_lock:
-                            transcript_buffer.append(item)
-                            if len(transcript_buffer) > 200:
-                                transcript_buffer.pop(0)
-
-                        # Broadcast via WebSockets
-                        print(f"[Live STT] Real Transcript: {text}")
-                        asyncio.run_coroutine_threadsafe(broadcast_event("transcript", item), loop)
-                except Exception as stt_err:
-                    print(f"[STT Transcription Error] {stt_err}")
+        # Process Loopback Buffer (Participant)
+        if len(loopback_buffer) >= CHUNK_SIZE:
+            chunk = loopback_buffer[:CHUNK_SIZE]
+            loopback_buffer = loopback_buffer[CHUNK_SIZE:]
+            process_speech_chunk(chunk, "Participant")
 
         time.sleep(0.1)
 

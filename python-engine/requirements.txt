@@ -5,3 +5,4 @@ websockets>=12.0
 requests>=2.31.0
 sqlite-vec>=0.1.9
 pywin32; sys_platform == 'win32'
+pyaudiowpatch>=0.2.12; sys_platform == 'win32'
